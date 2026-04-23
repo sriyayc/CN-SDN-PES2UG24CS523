@@ -1,4 +1,6 @@
-
+"""
+Traffic Monitoring and Statistics Collector - POX version (patched)
+"""
 
 from pox.core import core
 from pox.lib.util import dpid_to_str
@@ -54,12 +56,16 @@ class TrafficMonitor(object):
             return
         dpid = event.dpid
         in_port = event.port
-        self.mac_to_port.setdefault(dpid, {})
-        self.mac_to_port[dpid][str(packet.src)] = in_port
+        src = packet.src
+        dst = packet.dst
 
-        dst_port = self.mac_to_port[dpid].get(str(packet.dst))
+        self.mac_to_port.setdefault(dpid, {})
+        self.mac_to_port[dpid][src] = in_port
+
+        dst_port = self.mac_to_port[dpid].get(dst)
 
         if dst_port is None:
+            # unknown destination - flood the packet
             msg = of.ofp_packet_out()
             msg.data = event.ofp
             msg.actions.append(of.ofp_action_output(port=of.OFPP_FLOOD))
@@ -67,16 +73,23 @@ class TrafficMonitor(object):
             event.connection.send(msg)
             return
 
+        # known destination - install priority=1 flow rule
+        # Build match explicitly instead of from_packet() to avoid field conflicts
+        match = of.ofp_match()
+        match.in_port = in_port
+        match.dl_src = src
+        match.dl_dst = dst
+
         msg = of.ofp_flow_mod()
-        msg.match = of.ofp_match.from_packet(packet, in_port)
-        msg.match.dl_src = packet.src
-        msg.match.dl_dst = packet.dst
+        msg.match = match
         msg.idle_timeout = 30
         msg.hard_timeout = 120
         msg.priority = 1
         msg.actions.append(of.ofp_action_output(port=dst_port))
         msg.data = event.ofp
         event.connection.send(msg)
+        log.info("Flow installed: %s -> %s (port %s -> %s)",
+                 src, dst, in_port, dst_port)
 
     def _request_stats(self):
         for conn in core.openflow.connections:
