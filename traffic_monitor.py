@@ -1,125 +1,80 @@
-from ryu.base import app_manager
-from ryu.controller import ofp_event
-from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER, DEAD_DISPATCHER
-from ryu.controller.handler import set_ev_cls
-from ryu.ofproto import ofproto_v1_3
-from ryu.lib.packet import packet, ethernet, ipv4
-from ryu.lib import hub
-import logging
-import datetime
+from pox.core import core
+from pox.lib.util import dpid_to_str
+from pox.lib.packet import ethernet, ipv4, icmp
+import pox.openflow.libopenflow_01 as of
+from datetime import datetime
 
-LOG = logging.getLogger('traffic_monitor')
+log = core.getLogger()
+
 BLOCKED_IPS = ['10.0.0.4']
 
-class TrafficMonitor(app_manager.RyuApp):
-    OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
+class TrafficMonitor(object):
 
-    def __init__(self, *args, **kwargs):
-        super(TrafficMonitor, self).__init__(*args, **kwargs)
+    def __init__(self, connection):
+        self.connection = connection
         self.mac_to_port = {}
-        self.datapaths = {}
-        self.monitor_thread = hub.spawn(self._monitor)
+        connection.addListeners(self)
+        self._install_firewall_rules()
+        log.info("Switch connected: %s", dpid_to_str(connection.dpid))
 
-    @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
-    def switch_features_handler(self, ev):
-        datapath = ev.msg.datapath
-        ofproto = datapath.ofproto
-        parser = datapath.ofproto_parser
-
-        match = parser.OFPMatch()
-        actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER, ofproto.OFPCML_NO_BUFFER)]
-        self.add_flow(datapath, 0, match, actions)
-
+    def _install_firewall_rules(self):
         for ip in BLOCKED_IPS:
-            match = parser.OFPMatch(eth_type=0x0800, ipv4_src=ip)
-            self.add_flow(datapath, 100, match, [])
+            msg = of.ofp_flow_mod()
+            msg.priority = 100
+            msg.match.dl_type = 0x0800
+            msg.match.nw_src = ip
+            self.connection.send(msg)
+            log.info("Firewall: DROP traffic from %s", ip)
 
-    def add_flow(self, datapath, priority, match, actions, idle=0, hard=0):
-        ofproto = datapath.ofproto
-        parser = datapath.ofproto_parser
-        inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
-        mod = parser.OFPFlowMod(datapath=datapath, priority=priority, match=match,
-                                instructions=inst, idle_timeout=idle, hard_timeout=hard)
-        datapath.send_msg(mod)
-
-    @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
-    def packet_in_handler(self, ev):
-        msg = ev.msg
-        datapath = msg.datapath
-        ofproto = datapath.ofproto
-        parser = datapath.ofproto_parser
-        in_port = msg.match['in_port']
-        dpid = datapath.id
-
-        pkt = packet.Packet(msg.data)
-        eth = pkt.get_protocol(ethernet.ethernet)
-        if eth is None:
+    def _handle_PacketIn(self, event):
+        packet = event.parsed
+        if not packet.parsed:
             return
 
-        dst = eth.dst
-        src = eth.src
+        dpid = event.connection.dpid
+        in_port = event.port
+
         self.mac_to_port.setdefault(dpid, {})
-        self.mac_to_port[dpid][src] = in_port
+        self.mac_to_port[dpid][packet.src] = in_port
 
-        if dst in self.mac_to_port[dpid]:
-            out_port = self.mac_to_port[dpid][dst]
+        if packet.dst in self.mac_to_port[dpid]:
+            out_port = self.mac_to_port[dpid][packet.dst]
         else:
-            out_port = ofproto.OFPP_FLOOD
+            out_port = of.OFPP_FLOOD
 
-        actions = [parser.OFPActionOutput(out_port)]
+        ip_packet = packet.find('ipv4')
+        if ip_packet:
+            log.info("[%s] DPID=%s | %s -> %s | Port %s->%s",
+                     datetime.now().strftime("%H:%M:%S"),
+                     dpid_to_str(dpid),
+                     ip_packet.srcip, ip_packet.dstip,
+                     in_port, out_port)
 
-        ip_pkt = pkt.get_protocol(ipv4.ipv4)
-        if ip_pkt:
-            LOG.info("[%s] DPID=%s | %s -> %s | Port %s->%s",
-                     datetime.datetime.now().strftime("%H:%M:%S"),
-                     dpid, ip_pkt.src, ip_pkt.dst, in_port, out_port)
+        msg = of.ofp_packet_out()
+        msg.in_port = in_port
+        msg.data = event.ofp
 
-        if out_port != ofproto.OFPP_FLOOD:
-            match = parser.OFPMatch(in_port=in_port, eth_dst=dst, eth_src=src)
-            self.add_flow(datapath, 10, match, actions, idle=30)
+        if out_port != of.OFPP_FLOOD:
+            flow_mod = of.ofp_flow_mod()
+            flow_mod.priority = 10
+            flow_mod.match.dl_src = packet.src
+            flow_mod.match.dl_dst = packet.dst
+            flow_mod.match.in_port = in_port
+            flow_mod.idle_timeout = 30
+            flow_mod.actions.append(of.ofp_action_output(port=out_port))
+            self.connection.send(flow_mod)
 
-        out = parser.OFPPacketOut(datapath=datapath, buffer_id=msg.buffer_id,
-                                  in_port=in_port, actions=actions, data=msg.data)
-        datapath.send_msg(out)
+        msg.actions.append(of.ofp_action_output(port=out_port))
+        event.connection.send(msg)
 
-    @set_ev_cls(ofp_event.EventOFPStateChange, [MAIN_DISPATCHER, DEAD_DISPATCHER])
-    def state_change_handler(self, ev):
-        datapath = ev.datapath
-        if ev.state == MAIN_DISPATCHER:
-            self.datapaths[datapath.id] = datapath
-        elif ev.state == DEAD_DISPATCHER:
-            self.datapaths.pop(datapath.id, None)
+class TrafficMonitorLauncher(object):
 
-    def _monitor(self):
-        while True:
-            for dp in list(self.datapaths.values()):
-                self._request_stats(dp)
-            hub.sleep(10)
+    def __init__(self):
+        core.openflow.addListeners(self)
+        log.info("Traffic Monitor started. Blocked IPs: %s", BLOCKED_IPS)
 
-    def _request_stats(self, datapath):
-        parser = datapath.ofproto_parser
-        datapath.send_msg(parser.OFPFlowStatsRequest(datapath))
-        datapath.send_msg(parser.OFPPortStatsRequest(datapath, 0, datapath.ofproto.OFPP_ANY))
+    def _handle_ConnectionUp(self, event):
+        TrafficMonitor(event.connection)
 
-    @set_ev_cls(ofp_event.EventOFPFlowStatsReply, MAIN_DISPATCHER)
-    def flow_stats_reply_handler(self, ev):
-        body = ev.msg.body
-        dpid = ev.msg.datapath.id
-        LOG.info("=== Flow Stats DPID %s ===", dpid)
-        LOG.info("%-20s %-20s %-10s %-10s", 'SRC-IP', 'DST-IP', 'PACKETS', 'BYTES')
-        for stat in sorted(body, key=lambda s: s.priority, reverse=True):
-            match = stat.match
-            src = match.get('ipv4_src', 'N/A')
-            dst = match.get('ipv4_dst', 'N/A')
-            LOG.info("%-20s %-20s %-10s %-10s", src, dst, stat.packet_count, stat.byte_count)
-
-    @set_ev_cls(ofp_event.EventOFPPortStatsReply, MAIN_DISPATCHER)
-    def port_stats_reply_handler(self, ev):
-        body = ev.msg.body
-        dpid = ev.msg.datapath.id
-        LOG.info("=== Port Stats DPID %s ===", dpid)
-        LOG.info("%-8s %-12s %-12s %-12s %-12s", 'PORT', 'RX-PKTS', 'TX-PKTS', 'RX-BYTES', 'TX-BYTES')
-        for stat in body:
-            LOG.info("%-8s %-12s %-12s %-12s %-12s",
-                     stat.port_no, stat.rx_packets, stat.tx_packets,
-                     stat.rx_bytes, stat.tx_bytes)
+def launch():
+    core.registerNew(TrafficMonitorLauncher)
