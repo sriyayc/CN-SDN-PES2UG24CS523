@@ -7,7 +7,7 @@ from mininet.log import setLogLevel, info
 def custom_topology():
     net = Mininet(controller=RemoteController, switch=OVSKernelSwitch, link=TCLink)
 
-    c0 = net.addController('c0', controller=RemoteController, ip='127.0.0.1', port=6653)
+    c0 = net.addController('c0', controller=RemoteController, ip='127.0.0.1', port=6633)
 
     s1 = net.addSwitch('s1')
     s2 = net.addSwitch('s2')
