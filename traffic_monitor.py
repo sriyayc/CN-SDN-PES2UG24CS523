@@ -1,6 +1,4 @@
-"""
-Traffic Monitoring and Statistics Collector - POX version (patched)
-"""
+
 
 from pox.core import core
 from pox.lib.util import dpid_to_str
